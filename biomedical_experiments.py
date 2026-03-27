@@ -1,8 +1,16 @@
 """
-Biomedical Dataset Experiments — Full Matrix
-5 Activation Functions x 3 Architectures = 15 Experiments
-Phase 1: DINO Self-Supervised Pretraining (200 epochs each)
-Phase 2: Supervised Fine-tuning (100 epochs each)
+Capstone Full Experiment Suite
+===============================
+5 Activation Functions x 4 Architecture Configs x 2 Datasets = 40 Experiments
+
+Architectures:
+  1. ViT (no SSL)   — trained from scratch
+  2. ViT + DINO     — SSL pretrained → fine-tuned
+  3. CaiT + DINO    — SSL pretrained → fine-tuned
+  4. Swin + DINO    — SSL pretrained → fine-tuned
+
+Activations: GELU, ReLU, SiLU, Tanh, Mish
+Datasets: CIFAR-10, Biomedical
 
 Run on Google Colab with GPU runtime.
 """
@@ -54,9 +62,10 @@ warnings.filterwarnings('ignore')
 DRIVE_ROOT = "/content/gdrive/MyDrive"  # Google Drive mount point
 PROJECT_DIR = os.path.join(DRIVE_ROOT, "Project")  # Where your project lives
 BIOMEDICAL_ZIP = os.path.join(PROJECT_DIR, "datasets/biomedical.zip")
-DATA_DIR = os.path.join(PROJECT_DIR, "datasets/biomedical")
-RESULTS_DIR = os.path.join(PROJECT_DIR, "results_biomedical")
-CHECKPOINTS_DIR = os.path.join(PROJECT_DIR, "checkpoints_biomedical")
+BIOMEDICAL_DIR = os.path.join(PROJECT_DIR, "datasets/biomedical")
+CIFAR10_DIR = os.path.join(PROJECT_DIR, "data")  # CIFAR-10 data path
+RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
+CHECKPOINTS_DIR = os.path.join(PROJECT_DIR, "checkpoints")
 
 # --- EXPERIMENT MATRIX ---
 ACTIVATIONS = {
@@ -67,7 +76,15 @@ ACTIVATIONS = {
     "Mish": nn.Mish,
 }
 
-ARCHITECTURES = ["vit", "cait", "swin"]
+# 4 architecture configs: (arch, use_ssl)
+ARCH_CONFIGS = [
+    ("vit",  False, "ViT (no SSL)"),      # ViT trained from scratch
+    ("vit",  True,  "ViT + DINO"),         # ViT with SSL pretraining
+    ("cait", True,  "CaiT + DINO"),        # CaiT with SSL pretraining
+    ("swin", True,  "Swin + DINO"),        # Swin with SSL pretraining
+]
+
+DATASETS = ["CIFAR10", "Biomedical"]
 
 # --- TRAINING HYPERPARAMS ---
 PRETRAIN_EPOCHS = 200
@@ -81,9 +98,10 @@ WARMUP_EPOCHS = 30
 FINETUNE_WARMUP = 10
 SEED = 0
 
-# --- SKIP FLAGS (set True to skip phase) ---
-SKIP_PRETRAINING = False  # Set True to skip SSL and use random init
-FAST_MODE = False  # Set True for reduced epochs (pretrain=50, finetune=30)
+# --- CONTROL FLAGS ---
+FAST_MODE = False       # Reduced epochs (pretrain=50, finetune=30) for testing
+RUN_DATASETS = None     # Set to ["CIFAR10"] or ["Biomedical"] to run only one dataset, None = both
+RUN_ARCHS = None        # Set to [0,1,2,3] indices to run specific configs, None = all
 
 if FAST_MODE:
     PRETRAIN_EPOCHS = 50
@@ -102,65 +120,75 @@ if torch.cuda.is_available():
 # CELL 3: Dataset Setup (Biomedical)
 # ==============================================================================
 
-def setup_biomedical_dataset():
-    """Unzip and detect biomedical dataset structure."""
+def setup_dataset(dataset_name):
+    """Setup CIFAR-10 or Biomedical dataset. Returns (train_dir, val_dir, n_classes, img_size, img_mean, img_std)."""
 
-    # Unzip if needed
-    if not os.path.exists(DATA_DIR) and os.path.exists(BIOMEDICAL_ZIP):
-        print(f"Extracting {BIOMEDICAL_ZIP}...")
-        import zipfile
-        with zipfile.ZipFile(BIOMEDICAL_ZIP, 'r') as z:
-            z.extractall(os.path.dirname(DATA_DIR))
-        print("Done.")
+    if dataset_name == "CIFAR10":
+        # CIFAR-10: use torchvision (auto-downloads)
+        n_classes = 10
+        img_size = 32
+        img_mean = (0.4914, 0.4822, 0.4465)
+        img_std = (0.2470, 0.2435, 0.2616)
+        # We'll handle CIFAR-10 specially in data loading (not ImageFolder)
+        return None, None, n_classes, img_size, img_mean, img_std
 
-    # Auto-detect dataset structure
-    if os.path.exists(DATA_DIR):
-        # Check for train/val/test split
-        if os.path.isdir(os.path.join(DATA_DIR, "train")):
-            train_dir = os.path.join(DATA_DIR, "train")
-            val_dir = os.path.join(DATA_DIR, "val") if os.path.isdir(os.path.join(DATA_DIR, "val")) else os.path.join(DATA_DIR, "test")
-        else:
-            # Single directory with class subfolders — we'll split later
-            train_dir = DATA_DIR
-            val_dir = None
+    elif dataset_name == "Biomedical":
+        # Try to load from Drive
+        if not os.path.exists(BIOMEDICAL_DIR) and os.path.exists(BIOMEDICAL_ZIP):
+            print(f"Extracting {BIOMEDICAL_ZIP}...")
+            import zipfile
+            with zipfile.ZipFile(BIOMEDICAL_ZIP, 'r') as z:
+                z.extractall(os.path.dirname(BIOMEDICAL_DIR))
+            print("Done.")
 
-        # Count classes
-        classes = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
-        n_classes = len(classes)
+        if os.path.exists(BIOMEDICAL_DIR):
+            if os.path.isdir(os.path.join(BIOMEDICAL_DIR, "train")):
+                train_dir = os.path.join(BIOMEDICAL_DIR, "train")
+                val_dir = os.path.join(BIOMEDICAL_DIR, "val") if os.path.isdir(os.path.join(BIOMEDICAL_DIR, "val")) else os.path.join(BIOMEDICAL_DIR, "test")
+            else:
+                train_dir = BIOMEDICAL_DIR
+                val_dir = None
 
-        # Detect image size from first image
-        from PIL import Image
-        for cls in classes:
-            cls_dir = os.path.join(train_dir, cls)
-            for img_name in os.listdir(cls_dir):
-                if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-                    img = Image.open(os.path.join(cls_dir, img_name))
-                    img_size = max(img.size)  # Use the larger dimension
-                    # Round up to nearest multiple of 8
-                    img_size = max(32, ((img_size + 7) // 8) * 8)
-                    print(f"Biomedical dataset: {n_classes} classes, detected img size: {img.size} -> using {img_size}")
-                    return train_dir, val_dir, n_classes, img_size
+            classes = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
+            n_classes = len(classes)
 
-    # Fallback: use MedMNIST PathMNIST
-    print("Biomedical dataset not found. Downloading PathMNIST from MedMNIST...")
-    import medmnist
-    from medmnist import PathMNIST
+            from PIL import Image
+            for cls in classes:
+                cls_dir = os.path.join(train_dir, cls)
+                for img_name in os.listdir(cls_dir):
+                    if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+                        img = Image.open(os.path.join(cls_dir, img_name))
+                        img_size = max(img.size)
+                        img_size = max(32, ((img_size + 7) // 8) * 8)
+                        print(f"Biomedical: {n_classes} classes, img_size={img_size}")
+                        img_mean, img_std = compute_dataset_stats(train_dir, img_size)
+                        return train_dir, val_dir, n_classes, img_size, img_mean, img_std
 
-    data_dir = os.path.join(os.path.dirname(DATA_DIR), "pathmnist")
-    os.makedirs(data_dir, exist_ok=True)
+        # Fallback: MedMNIST PathMNIST (colorectal histology — 9 tissue types)
+        print("Biomedical zip not found. Downloading PathMNIST from MedMNIST...")
+        import medmnist
+        from medmnist import PathMNIST
 
-    # Download and organize into ImageFolder format
-    for split in ['train', 'val', 'test']:
-        ds = PathMNIST(split=split, download=True, root=data_dir)
-        split_dir = os.path.join(data_dir, split)
-        for i in range(len(ds)):
-            img, label = ds[i]
-            label = int(label.item()) if hasattr(label, 'item') else int(label[0])
-            cls_dir = os.path.join(split_dir, f"class_{label:02d}")
-            os.makedirs(cls_dir, exist_ok=True)
-            img.save(os.path.join(cls_dir, f"{i:06d}.png"))
+        data_dir = os.path.join(os.path.dirname(BIOMEDICAL_DIR), "pathmnist")
+        os.makedirs(data_dir, exist_ok=True)
 
-    return os.path.join(data_dir, "train"), os.path.join(data_dir, "val"), 9, 32
+        for split in ['train', 'val', 'test']:
+            split_dir = os.path.join(data_dir, split)
+            if os.path.exists(split_dir):
+                continue
+            ds = PathMNIST(split=split, download=True, root=data_dir)
+            for i in range(len(ds)):
+                img, label = ds[i]
+                label = int(label.item()) if hasattr(label, 'item') else int(label[0])
+                cls_dir = os.path.join(split_dir, f"class_{label:02d}")
+                os.makedirs(cls_dir, exist_ok=True)
+                img.save(os.path.join(cls_dir, f"{i:06d}.png"))
+
+        img_mean, img_std = compute_dataset_stats(os.path.join(data_dir, "train"), 32)
+        return os.path.join(data_dir, "train"), os.path.join(data_dir, "val"), 9, 32, img_mean, img_std
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
 def compute_dataset_stats(train_dir, img_size):
@@ -967,10 +995,10 @@ class MultiCropWrapper(nn.Module):
         return self.head(output)
 
 
-def pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std, train_dir, n_classes):
+def pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std, train_dir, n_classes, dataset_name="Biomedical"):
     """Run DINO self-supervised pretraining for a given arch+activation combo."""
 
-    exp_name = f"{arch}_{act_name}_biomedical"
+    exp_name = f"{dataset_name}_{arch}_{act_name}"
     ckpt_dir = os.path.join(CHECKPOINTS_DIR, exp_name)
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -1002,8 +1030,8 @@ def pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std, train_
         transforms.ToTensor(), normalize])
 
     class MultiCropDataset(torch.utils.data.Dataset):
-        def __init__(self, root, global_transform, local_transform, n_local=8):
-            self.dataset = datasets.ImageFolder(root)
+        def __init__(self, base_dataset, global_transform, local_transform, n_local=8):
+            self.dataset = base_dataset
             self.global_t = global_transform
             self.local_t = local_transform
             self.n_local = n_local
@@ -1018,7 +1046,12 @@ def pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std, train_
                 crops.append(self.local_t(img))
             return crops
 
-    dataset = MultiCropDataset(train_dir, global_transform, local_transform, n_local=8)
+    if dataset_name == "CIFAR10":
+        base_dataset = datasets.CIFAR10(root=CIFAR10_DIR, train=True, download=True)
+    else:
+        base_dataset = datasets.ImageFolder(train_dir)
+
+    dataset = MultiCropDataset(base_dataset, global_transform, local_transform, n_local=8)
     loader = DataLoader(dataset, batch_size=min(BATCH_SIZE, 128), shuffle=True, num_workers=2,
                         pin_memory=True, drop_last=True,
                         collate_fn=lambda batch: [torch.stack([b[i] for b in batch]) for i in range(10)])
@@ -1086,10 +1119,10 @@ def pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std, train_
 # ==============================================================================
 
 def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
-             train_dir, val_dir, pretrain_ckpt=None):
+             train_dir, val_dir, dataset_name, config_label, pretrain_ckpt=None):
     """Fine-tune a model with supervised learning."""
 
-    exp_name = f"{arch}_{act_name}_biomedical"
+    exp_name = f"{dataset_name}_{config_label.replace(' ', '_').replace('+', '')}_{act_name}"
     save_dir = os.path.join(RESULTS_DIR, exp_name)
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1098,10 +1131,10 @@ def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
     if os.path.exists(results_file):
         with open(results_file) as f:
             results = json.load(f)
-        print(f"  [SKIP] Already completed: {act_name}/{arch} -> {results['best_val_acc']:.2f}%")
+        print(f"  [SKIP] Already completed: {config_label}/{act_name}/{dataset_name} -> {results['best_val_acc']:.2f}%")
         return results
 
-    print(f"  Fine-tuning {arch}/{act_name} ({FINETUNE_EPOCHS} epochs)...")
+    print(f"  Fine-tuning {config_label}/{act_name} on {dataset_name} ({FINETUNE_EPOCHS} epochs)...")
 
     # Data
     normalize = [transforms.Normalize(img_mean, img_std)]
@@ -1117,18 +1150,20 @@ def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(), *normalize])
 
-    train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
-
-    if val_dir and os.path.exists(val_dir):
-        val_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
+    # Load dataset
+    if dataset_name == "CIFAR10":
+        train_dataset = datasets.CIFAR10(root=CIFAR10_DIR, train=True, download=True, transform=train_transforms)
+        val_dataset = datasets.CIFAR10(root=CIFAR10_DIR, train=False, download=True, transform=val_transforms)
     else:
-        # Split train into train/val (80/20)
-        n = len(train_dataset)
-        n_val = int(0.2 * n)
-        n_train = n - n_val
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(SEED))
+        train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
+        if val_dir and os.path.exists(val_dir):
+            val_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
+        else:
+            n = len(train_dataset)
+            n_val = int(0.2 * n)
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                train_dataset, [n - n_val, n_val],
+                generator=torch.Generator().manual_seed(SEED))
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
@@ -1193,8 +1228,9 @@ def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
     # Save results
     results = {
         "arch": arch,
+        "config_label": config_label,
         "activation": act_name,
-        "dataset": "biomedical",
+        "dataset": dataset_name,
         "best_val_acc": best_val_acc,
         "final_val_acc": history["val_acc"][-1],
         "final_train_acc": history["train_acc"][-1],
@@ -1210,7 +1246,7 @@ def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
     # Save history CSV
     pd.DataFrame(history).to_csv(os.path.join(save_dir, "history.csv"), index=False)
 
-    print(f"  Done: {arch}/{act_name} -> Best Val Acc: {best_val_acc:.2f}%")
+    print(f"  Done: {config_label}/{act_name}/{dataset_name} -> Best Val Acc: {best_val_acc:.2f}%")
     return results
 
 
@@ -1219,9 +1255,8 @@ def finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
 # ==============================================================================
 
 def run_all_experiments():
-    """Run all 15 experiments: 5 activations x 3 architectures."""
+    """Run all 40 experiments: 5 activations x 4 arch configs x 2 datasets."""
 
-    # Setup
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
@@ -1239,67 +1274,78 @@ def run_all_experiments():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    # Setup dataset
-    print("=" * 60)
-    print("SETTING UP BIOMEDICAL DATASET")
-    print("=" * 60)
-    train_dir, val_dir, n_classes, img_size = setup_biomedical_dataset()
-    print(f"Dataset: {n_classes} classes, img_size={img_size}")
-    print(f"Train dir: {train_dir}")
-    print(f"Val dir: {val_dir}")
+    # Determine which datasets and archs to run
+    ds_list = RUN_DATASETS if RUN_DATASETS else DATASETS
+    arch_indices = RUN_ARCHS if RUN_ARCHS else list(range(len(ARCH_CONFIGS)))
 
-    # Compute stats
-    stats_file = os.path.join(RESULTS_DIR, "dataset_stats.json")
-    if os.path.exists(stats_file):
-        with open(stats_file) as f:
-            stats = json.load(f)
-        img_mean, img_std = tuple(stats["mean"]), tuple(stats["std"])
-    else:
-        img_mean, img_std = compute_dataset_stats(train_dir, img_size)
-        with open(stats_file, "w") as f:
-            json.dump({"mean": list(img_mean), "std": list(img_std)}, f)
-    print(f"Mean: {img_mean}, Std: {img_std}")
-
-    # Run experiments
     all_results = []
-    total = len(ARCHITECTURES) * len(ACTIVATIONS)
+    total = len(ds_list) * len(arch_indices) * len(ACTIVATIONS)
     current = 0
 
-    for arch in ARCHITECTURES:
-        for act_name, act_layer in ACTIVATIONS.items():
-            current += 1
-            print(f"\n{'=' * 60}")
-            print(f"EXPERIMENT [{current}/{total}]: {arch.upper()} + {act_name}")
-            print(f"{'=' * 60}")
+    for dataset_name in ds_list:
+        print(f"\n{'#' * 70}")
+        print(f"# DATASET: {dataset_name}")
+        print(f"{'#' * 70}")
 
-            # Phase 1: Pretraining
-            pretrain_ckpt = None
-            if not SKIP_PRETRAINING:
-                pretrain_ckpt = pretrain_dino(arch, act_layer, act_name, img_size, img_mean, img_std,
-                                             train_dir, n_classes)
+        # Setup dataset
+        train_dir, val_dir, n_classes, img_size, img_mean, img_std = setup_dataset(dataset_name)
+        print(f"  Classes: {n_classes}, Image size: {img_size}")
+        print(f"  Mean: {img_mean}, Std: {img_std}")
 
-            # Phase 2: Fine-tuning
-            results = finetune(arch, act_layer, act_name, img_size, n_classes, img_mean, img_std,
-                              train_dir, val_dir, pretrain_ckpt)
-            all_results.append(results)
+        for arch_idx in arch_indices:
+            arch, use_ssl, config_label = ARCH_CONFIGS[arch_idx]
 
-    # Summary table
-    print(f"\n{'=' * 60}")
-    print("FINAL RESULTS — Biomedical Dataset")
-    print(f"{'=' * 60}")
+            for act_name, act_layer in ACTIVATIONS.items():
+                current += 1
+                print(f"\n{'=' * 60}")
+                print(f"EXPERIMENT [{current}/{total}]: {config_label} + {act_name} on {dataset_name}")
+                print(f"{'=' * 60}")
+
+                # Phase 1: Pretraining (skip for ViT no-SSL)
+                pretrain_ckpt = None
+                if use_ssl:
+                    if dataset_name == "CIFAR10":
+                        # For CIFAR-10 DINO, we need ImageFolder format
+                        # Use torchvision CIFAR10 dataset directly in pretrain
+                        pretrain_ckpt = pretrain_dino(arch, act_layer, act_name,
+                                                     img_size, img_mean, img_std,
+                                                     train_dir, n_classes,
+                                                     dataset_name=dataset_name)
+                    else:
+                        pretrain_ckpt = pretrain_dino(arch, act_layer, act_name,
+                                                     img_size, img_mean, img_std,
+                                                     train_dir, n_classes,
+                                                     dataset_name=dataset_name)
+
+                # Phase 2: Fine-tuning
+                results = finetune(arch, act_layer, act_name, img_size, n_classes,
+                                  img_mean, img_std, train_dir, val_dir,
+                                  dataset_name, config_label, pretrain_ckpt)
+                all_results.append(results)
+
+    # ===== FINAL SUMMARY =====
+    print(f"\n{'#' * 70}")
+    print("FINAL RESULTS — All Experiments")
+    print(f"{'#' * 70}")
 
     summary = pd.DataFrame([{
-        "Architecture": r["arch"].upper(),
+        "Dataset": r["dataset"],
+        "Architecture": r["config_label"],
         "Activation": r["activation"],
         "Best Val Acc (%)": f"{r['best_val_acc']:.2f}",
         "Final Val Loss": f"{r['final_val_loss']:.4f}",
         "Params (M)": f"{r['n_params_M']:.2f}",
+        "SSL Pretrained": r["pretrained"],
     } for r in all_results])
 
-    print(summary.to_string(index=False))
+    # Print per-dataset summary
+    for ds in ds_list:
+        ds_summary = summary[summary["Dataset"] == ds]
+        print(f"\n--- {ds} ---")
+        print(ds_summary.to_string(index=False))
 
-    # Save summary
-    summary.to_csv(os.path.join(RESULTS_DIR, "summary.csv"), index=False)
+    # Save
+    summary.to_csv(os.path.join(RESULTS_DIR, "summary_all.csv"), index=False)
     with open(os.path.join(RESULTS_DIR, "all_results.json"), "w") as f:
         json.dump(all_results, f, indent=2, default=str)
 
@@ -1312,80 +1358,231 @@ def run_all_experiments():
 # ==============================================================================
 
 def plot_results(results_dir=RESULTS_DIR):
-    """Generate comparison plots from saved results."""
+    """Generate comprehensive comparison plots from saved results."""
     import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.rcParams['figure.dpi'] = 150
 
     results_file = os.path.join(results_dir, "all_results.json")
     with open(results_file) as f:
         all_results = json.load(f)
 
-    archs = sorted(set(r["arch"] for r in all_results))
     acts = list(ACTIVATIONS.keys())
+    config_labels = [c[2] for c in ARCH_CONFIGS]
+    ds_list = sorted(set(r["dataset"] for r in all_results))
+    colors = {'GELU': '#2196F3', 'ReLU': '#FF5722', 'SiLU': '#4CAF50', 'Tanh': '#FF9800', 'Mish': '#9C27B0'}
 
-    # 1. Bar chart: Best Val Accuracy per activation per architecture
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
-    colors = ['#2196F3', '#FF5722', '#4CAF50', '#FF9800', '#9C27B0']
+    # =========================================================================
+    # PLOT 1: Per-dataset bar charts (4 architectures, 5 activations each)
+    # =========================================================================
+    for ds in ds_list:
+        ds_results = [r for r in all_results if r["dataset"] == ds]
+        configs_in_ds = sorted(set(r["config_label"] for r in ds_results),
+                              key=lambda x: config_labels.index(x) if x in config_labels else 99)
 
-    for idx, arch in enumerate(archs):
-        arch_results = [r for r in all_results if r["arch"] == arch]
-        arch_results.sort(key=lambda r: acts.index(r["activation"]))
-        accs = [r["best_val_acc"] for r in arch_results]
-        act_names = [r["activation"] for r in arch_results]
-        bars = axes[idx].bar(act_names, accs, color=colors[:len(act_names)], edgecolor='black', linewidth=0.5)
-        axes[idx].set_title(f"{arch.upper()}", fontsize=14, fontweight='bold')
-        axes[idx].set_ylabel("Best Val Accuracy (%)" if idx == 0 else "")
-        axes[idx].set_ylim(min(accs) - 5, max(accs) + 3)
-        for bar, acc in zip(bars, accs):
-            axes[idx].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.3,
-                          f'{acc:.1f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        fig, axes = plt.subplots(1, len(configs_in_ds), figsize=(5 * len(configs_in_ds), 6), sharey=True)
+        if len(configs_in_ds) == 1:
+            axes = [axes]
 
-    plt.suptitle("Biomedical Dataset — Best Validation Accuracy", fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "accuracy_comparison.png"), dpi=150, bbox_inches='tight')
-    plt.show()
+        for idx, cfg in enumerate(configs_in_ds):
+            cfg_results = sorted([r for r in ds_results if r["config_label"] == cfg],
+                                key=lambda r: acts.index(r["activation"]) if r["activation"] in acts else 99)
+            accs = [r["best_val_acc"] for r in cfg_results]
+            act_names = [r["activation"] for r in cfg_results]
+            bar_colors = [colors.get(a, '#888') for a in act_names]
+            bars = axes[idx].bar(act_names, accs, color=bar_colors, edgecolor='black', linewidth=0.5)
+            axes[idx].set_title(cfg, fontsize=13, fontweight='bold')
+            axes[idx].set_ylabel("Best Val Accuracy (%)" if idx == 0 else "")
+            if accs:
+                axes[idx].set_ylim(min(accs) - 5, max(accs) + 3)
+            for bar, acc in zip(bars, accs):
+                axes[idx].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.3,
+                              f'{acc:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            axes[idx].tick_params(axis='x', rotation=30)
 
-    # 2. Training curves: Val accuracy over epochs
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+        plt.suptitle(f"{ds} — Best Validation Accuracy by Architecture & Activation",
+                     fontsize=15, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f"{ds}_accuracy_bars.png"), dpi=150, bbox_inches='tight')
+        plt.show()
 
-    for idx, arch in enumerate(archs):
-        arch_results = [r for r in all_results if r["arch"] == arch]
-        for r, color in zip(arch_results, colors):
-            if "history" in r:
-                axes[idx].plot(r["history"]["val_acc"], label=r["activation"], color=color, linewidth=1.5)
-        axes[idx].set_title(f"{arch.upper()} — Val Accuracy", fontsize=14, fontweight='bold')
-        axes[idx].set_xlabel("Epoch")
-        axes[idx].set_ylabel("Validation Accuracy (%)" if idx == 0 else "")
-        axes[idx].legend(fontsize=9)
-        axes[idx].grid(True, alpha=0.3)
+    # =========================================================================
+    # PLOT 2: Training convergence curves (per dataset, per architecture)
+    # =========================================================================
+    for ds in ds_list:
+        ds_results = [r for r in all_results if r["dataset"] == ds]
+        configs_in_ds = sorted(set(r["config_label"] for r in ds_results),
+                              key=lambda x: config_labels.index(x) if x in config_labels else 99)
 
-    plt.suptitle("Biomedical Dataset — Training Convergence", fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "convergence_curves.png"), dpi=150, bbox_inches='tight')
-    plt.show()
+        fig, axes = plt.subplots(1, len(configs_in_ds), figsize=(5 * len(configs_in_ds), 5), sharey=True)
+        if len(configs_in_ds) == 1:
+            axes = [axes]
 
-    # 3. Cross-architecture heatmap
-    fig, ax = plt.subplots(figsize=(8, 5))
-    data = np.zeros((len(acts), len(archs)))
-    for r in all_results:
-        i = acts.index(r["activation"])
-        j = archs.index(r["arch"])
-        data[i, j] = r["best_val_acc"]
+        for idx, cfg in enumerate(configs_in_ds):
+            cfg_results = sorted([r for r in ds_results if r["config_label"] == cfg],
+                                key=lambda r: acts.index(r["activation"]) if r["activation"] in acts else 99)
+            for r in cfg_results:
+                if "history" in r and r["history"]:
+                    axes[idx].plot(r["history"]["val_acc"], label=r["activation"],
+                                  color=colors.get(r["activation"], '#888'), linewidth=1.5)
+            axes[idx].set_title(cfg, fontsize=13, fontweight='bold')
+            axes[idx].set_xlabel("Epoch")
+            axes[idx].set_ylabel("Val Accuracy (%)" if idx == 0 else "")
+            axes[idx].legend(fontsize=8)
+            axes[idx].grid(True, alpha=0.3)
 
-    im = ax.imshow(data, cmap='YlOrRd', aspect='auto')
-    ax.set_xticks(range(len(archs)))
-    ax.set_xticklabels([a.upper() for a in archs])
-    ax.set_yticks(range(len(acts)))
-    ax.set_yticklabels(acts)
-    for i in range(len(acts)):
-        for j in range(len(archs)):
-            ax.text(j, i, f"{data[i, j]:.1f}%", ha="center", va="center", fontsize=12, fontweight='bold')
-    plt.colorbar(im, label="Best Val Accuracy (%)")
-    plt.title("Cross-Architecture Accuracy Heatmap", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "heatmap.png"), dpi=150, bbox_inches='tight')
-    plt.show()
+        plt.suptitle(f"{ds} — Validation Accuracy Convergence", fontsize=15, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f"{ds}_convergence.png"), dpi=150, bbox_inches='tight')
+        plt.show()
 
-    print("Plots saved!")
+    # =========================================================================
+    # PLOT 3: Cross-dataset heatmaps (one per architecture config)
+    # =========================================================================
+    for ds in ds_list:
+        ds_results = [r for r in all_results if r["dataset"] == ds]
+        configs_in_ds = sorted(set(r["config_label"] for r in ds_results),
+                              key=lambda x: config_labels.index(x) if x in config_labels else 99)
+        acts_in_ds = sorted(set(r["activation"] for r in ds_results),
+                           key=lambda x: acts.index(x) if x in acts else 99)
+
+        fig, ax = plt.subplots(figsize=(max(8, 2 * len(configs_in_ds)), max(5, len(acts_in_ds))))
+        data = np.zeros((len(acts_in_ds), len(configs_in_ds)))
+        for r in ds_results:
+            if r["activation"] in acts_in_ds and r["config_label"] in configs_in_ds:
+                i = acts_in_ds.index(r["activation"])
+                j = configs_in_ds.index(r["config_label"])
+                data[i, j] = r["best_val_acc"]
+
+        im = ax.imshow(data, cmap='YlOrRd', aspect='auto', vmin=data[data > 0].min() - 2 if (data > 0).any() else 0)
+        ax.set_xticks(range(len(configs_in_ds)))
+        ax.set_xticklabels(configs_in_ds, fontsize=10)
+        ax.set_yticks(range(len(acts_in_ds)))
+        ax.set_yticklabels(acts_in_ds, fontsize=10)
+        for i in range(len(acts_in_ds)):
+            for j in range(len(configs_in_ds)):
+                ax.text(j, i, f"{data[i,j]:.1f}%", ha="center", va="center", fontsize=11, fontweight='bold',
+                       color='white' if data[i,j] < np.median(data) else 'black')
+        plt.colorbar(im, label="Best Val Accuracy (%)")
+        plt.title(f"{ds} — Activation x Architecture Heatmap", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f"{ds}_heatmap.png"), dpi=150, bbox_inches='tight')
+        plt.show()
+
+    # =========================================================================
+    # PLOT 4: Cross-dataset comparison (side-by-side for each architecture)
+    # =========================================================================
+    if len(ds_list) >= 2:
+        all_configs = sorted(set(r["config_label"] for r in all_results),
+                            key=lambda x: config_labels.index(x) if x in config_labels else 99)
+
+        fig, axes = plt.subplots(1, len(all_configs), figsize=(5 * len(all_configs), 6), sharey=True)
+        if len(all_configs) == 1:
+            axes = [axes]
+
+        x = np.arange(len(acts))
+        width = 0.35
+
+        for idx, cfg in enumerate(all_configs):
+            for d_idx, ds in enumerate(ds_list):
+                cfg_ds_results = sorted([r for r in all_results if r["config_label"] == cfg and r["dataset"] == ds],
+                                       key=lambda r: acts.index(r["activation"]) if r["activation"] in acts else 99)
+                accs = [r["best_val_acc"] for r in cfg_ds_results]
+                act_labels = [r["activation"] for r in cfg_ds_results]
+                if accs:
+                    offset = (d_idx - 0.5) * width
+                    bars = axes[idx].bar(x[:len(accs)] + offset, accs, width, label=ds, alpha=0.85,
+                                        edgecolor='black', linewidth=0.5)
+                    for bar, acc in zip(bars, accs):
+                        axes[idx].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.2,
+                                      f'{acc:.1f}', ha='center', va='bottom', fontsize=7, fontweight='bold')
+
+            axes[idx].set_title(cfg, fontsize=13, fontweight='bold')
+            axes[idx].set_xticks(x)
+            axes[idx].set_xticklabels(acts, fontsize=9, rotation=30)
+            axes[idx].set_ylabel("Best Val Accuracy (%)" if idx == 0 else "")
+            axes[idx].legend(fontsize=9)
+            axes[idx].grid(True, alpha=0.2, axis='y')
+
+        plt.suptitle("Cross-Dataset Comparison — CIFAR-10 vs Biomedical", fontsize=15, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, "cross_dataset_comparison.png"), dpi=150, bbox_inches='tight')
+        plt.show()
+
+    # =========================================================================
+    # PLOT 5: SSL Impact (ViT no-SSL vs ViT+DINO)
+    # =========================================================================
+    for ds in ds_list:
+        vit_nosssl = [r for r in all_results if r["dataset"] == ds and r["config_label"] == "ViT (no SSL)"]
+        vit_ssl = [r for r in all_results if r["dataset"] == ds and r["config_label"] == "ViT + DINO"]
+
+        if vit_nosssl and vit_ssl:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            x = np.arange(len(acts))
+            width = 0.35
+
+            no_ssl_accs = {r["activation"]: r["best_val_acc"] for r in vit_nosssl}
+            ssl_accs = {r["activation"]: r["best_val_acc"] for r in vit_ssl}
+
+            no_ssl_vals = [no_ssl_accs.get(a, 0) for a in acts]
+            ssl_vals = [ssl_accs.get(a, 0) for a in acts]
+            gains = [ssl_vals[i] - no_ssl_vals[i] for i in range(len(acts))]
+
+            bars1 = ax.bar(x - width/2, no_ssl_vals, width, label='ViT (no SSL)', color='#E57373', edgecolor='black', linewidth=0.5)
+            bars2 = ax.bar(x + width/2, ssl_vals, width, label='ViT + DINO', color='#42A5F5', edgecolor='black', linewidth=0.5)
+
+            for i, (b1, b2, gain) in enumerate(zip(bars1, bars2, gains)):
+                ax.text(b1.get_x() + b1.get_width()/2., b1.get_height() + 0.2,
+                       f'{no_ssl_vals[i]:.1f}', ha='center', va='bottom', fontsize=9)
+                ax.text(b2.get_x() + b2.get_width()/2., b2.get_height() + 0.2,
+                       f'{ssl_vals[i]:.1f}', ha='center', va='bottom', fontsize=9)
+                ax.annotate(f'+{gain:.1f}%', xy=(x[i] + width/2, ssl_vals[i]),
+                           xytext=(x[i] + width/2 + 0.15, ssl_vals[i] + 1.5),
+                           fontsize=8, color='green', fontweight='bold',
+                           arrowprops=dict(arrowstyle='->', color='green', lw=1))
+
+            ax.set_xlabel("Activation Function")
+            ax.set_ylabel("Best Validation Accuracy (%)")
+            ax.set_title(f"{ds} — Impact of DINO Self-Supervised Pretraining on ViT", fontsize=14, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(acts)
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.2, axis='y')
+            avg_gain = np.mean(gains)
+            ax.text(0.98, 0.02, f'Avg SSL Gain: +{avg_gain:.2f}%', transform=ax.transAxes,
+                   ha='right', fontsize=11, fontweight='bold',
+                   bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, f"{ds}_ssl_impact.png"), dpi=150, bbox_inches='tight')
+            plt.show()
+
+    # =========================================================================
+    # PLOT 6: Best activation per architecture (winner table)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("BEST ACTIVATION PER ARCHITECTURE PER DATASET")
+    print("=" * 70)
+
+    winner_data = []
+    for ds in ds_list:
+        for cfg in config_labels:
+            cfg_results = [r for r in all_results if r["dataset"] == ds and r["config_label"] == cfg]
+            if cfg_results:
+                best = max(cfg_results, key=lambda r: r["best_val_acc"])
+                winner_data.append({
+                    "Dataset": ds,
+                    "Architecture": cfg,
+                    "Best Activation": best["activation"],
+                    "Accuracy (%)": f"{best['best_val_acc']:.2f}",
+                    "Runner-up": sorted(cfg_results, key=lambda r: -r["best_val_acc"])[1]["activation"] if len(cfg_results) > 1 else "N/A",
+                })
+
+    winner_df = pd.DataFrame(winner_data)
+    print(winner_df.to_string(index=False))
+    winner_df.to_csv(os.path.join(results_dir, "winners.csv"), index=False)
+
+    print(f"\nAll plots saved to {results_dir}/")
 
 
 # ==============================================================================
