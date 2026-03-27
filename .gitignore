@@ -1,0 +1,37 @@
+# Data & Datasets
+data/
+datasets/
+*.tar.gz
+*.zip
+
+# Model checkpoints & saved weights
+checkpoints/
+checkpoints_datasets/
+save_finetuned/
+*.pth
+*.pt
+*.ckpt
+
+# TensorBoard logs
+tensorboard/
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
